@@ -15,7 +15,7 @@ import base64
 import io
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from collections import defaultdict
 
 import anthropic
@@ -25,6 +25,11 @@ import replicate
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import hmac
+import hashlib
+import random
+import time
+import requests
 
 # ── Приложение ────────────────────────────────────────────────────────────
 app = FastAPI(title="AI Rabotilnica API", version="2.0")
@@ -48,6 +53,16 @@ if not REPLICATE_TOKEN:
 
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "")
 
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+if not RESEND_API_KEY:
+    print("ВНИМАНИЕ: Липсва RESEND_API_KEY — изпращането на кодове за вход няма да работи!")
+
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
+if not SECRET_KEY:
+    print("ВНИМАНИЕ: Липсва SECRET_KEY — влизането с код няма да работи безопасно!")
+
+LOGIN_FROM_EMAIL = "PODBG Tools <access@podbg.com>"
+
 claude = anthropic.Anthropic(api_key=API_KEY)
 
 # ── База данни (Neon Postgres) ────────────────────────────────────────────
@@ -62,7 +77,7 @@ def get_db_connection():
 
 
 def init_db():
-    """Създава таблицата members, ако още не съществува. Извиква се веднъж при старт."""
+    """Създава таблицата members и я обновява, ако още не съществува. Извиква се веднъж при старт."""
     if not DATABASE_URL:
         return
     with get_db_connection() as conn:
@@ -78,6 +93,9 @@ def init_db():
                     created_at   TIMESTAMPTZ DEFAULT now()
                 )
                 """
+            )
+            cur.execute(
+                "ALTER TABLE members ADD COLUMN IF NOT EXISTS access_code_expires TIMESTAMPTZ"
             )
         conn.commit()
 
@@ -100,6 +118,80 @@ def upsert_member(email: str, name: str, source: str) -> None:
                 (email, name, source),
             )
         conn.commit()
+
+
+def get_member(email: str):
+    """Връща реда от members за този имейл (или None), като dict."""
+    email = (email or "").strip().lower()
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM members WHERE email = %s", (email,))
+            return cur.fetchone()
+
+
+def set_login_code(email: str, code: str, expires_minutes: int = 15) -> None:
+    """Записва нов код за вход и времето му на изтичане за този член."""
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE members SET access_code = %s, access_code_expires = %s WHERE email = %s",
+                (code, expires_at, email),
+            )
+        conn.commit()
+
+
+def generate_login_code() -> str:
+    """Генерира 6-цифрен код за еднократен вход."""
+    return f"{random.randint(0, 999999):06d}"
+
+
+def make_access_token(email: str, days: int = 30) -> str:
+    """Прави подписан токен за достъп (без нужда от отделна таблица за сесии)."""
+    expires = int(time.time()) + days * 86400
+    payload = f"{email}|{expires}"
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    raw = f"{payload}|{sig}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def verify_access_token(token: str):
+    """Проверява токен за достъп; връща имейла, ако е валиден, иначе None."""
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        email, expires, sig = raw.split("|")
+        expected_sig = hmac.new(SECRET_KEY.encode(), f"{email}|{expires}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        if int(expires) < int(time.time()):
+            return None
+        return email
+    except Exception:
+        return None
+
+
+def send_login_code_email(to_email: str, code: str) -> None:
+    """Изпраща имейл с кода за вход през Resend."""
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY не е зададен.")
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+        json={
+            "from": LOGIN_FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"Твоят код за вход: {code}",
+            "html": (
+                f"<p>Здравей!</p>"
+                f"<p>Твоят код за вход в PODBG Tools Hub е:</p>"
+                f"<h2 style=\"letter-spacing:4px;\">{code}</h2>"
+                f"<p>Кодът е валиден 15 минути. Ако не си го поискала ти, просто игнорирай това писмо.</p>"
+            ),
+        },
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Resend грешка ({resp.status_code}): {resp.text}")
 
 
 @app.on_event("startup")
@@ -381,4 +473,73 @@ def skool_webhook(req: SkoolWebhookRequest, request: Request):
         raise HTTPException(status_code=502, detail=f"Грешка при запис в базата: {str(e)}")
 
     return {"status": "ok", "email": req.email.strip().lower()}
+
+
+# ── Вход с код по имейл ────────────────────────────────────────────────────
+class RequestCodeRequest(BaseModel):
+    email: str
+
+
+class VerifyCodeRequest(BaseModel):
+    email: str
+    code:  str
+
+
+@app.post("/request-code")
+async def request_code(req: RequestCodeRequest):
+    """Проверява дали имейлът е в списъка с членове и изпраща 6-цифрен код."""
+    email = (req.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Невалиден имейл.")
+
+    member = await asyncio.to_thread(get_member, email)
+    if not member or member.get("status") != "active":
+        raise HTTPException(
+            status_code=404,
+            detail="Този имейл не е в списъка с членове на общността."
+        )
+
+    code = generate_login_code()
+    await asyncio.to_thread(set_login_code, email, code)
+
+    try:
+        await asyncio.to_thread(send_login_code_email, email, code)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при изпращане на имейл: {str(e)}")
+
+    return {"status": "sent"}
+
+
+@app.post("/verify-code")
+async def verify_code(req: VerifyCodeRequest):
+    """Проверява кода и връща токен за достъп, ако е верен и все още валиден."""
+    email = (req.email or "").strip().lower()
+    code  = (req.code or "").strip()
+
+    member = await asyncio.to_thread(get_member, email)
+    if not member:
+        raise HTTPException(status_code=404, detail="Не е намерен член с този имейл.")
+
+    stored_code = member.get("access_code")
+    expires_at  = member.get("access_code_expires")
+    now         = datetime.now(timezone.utc)
+
+    if not stored_code or stored_code != code:
+        raise HTTPException(status_code=401, detail="Грешен код.")
+    if not expires_at or expires_at < now:
+        raise HTTPException(status_code=401, detail="Кодът е изтекъл. Поискай нов.")
+
+    token = make_access_token(email)
+    return {"status": "ok", "token": token, "name": member.get("name") or ""}
+
+
+@app.post("/check-token")
+async def check_token(request: Request):
+    """Проверява дали токен за достъп все още е валиден (за защитените страници)."""
+    body  = await request.json()
+    token = (body or {}).get("token", "")
+    email = verify_access_token(token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Невалиден или изтекъл достъп.")
+    return {"status": "ok", "email": email}
 
