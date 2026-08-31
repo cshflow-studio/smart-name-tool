@@ -15,10 +15,12 @@ import base64
 import io
 import os
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from collections import defaultdict
 
 import anthropic
+import psycopg2
+import psycopg2.extras
 import replicate
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,6 +49,67 @@ if not REPLICATE_TOKEN:
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "")
 
 claude = anthropic.Anthropic(api_key=API_KEY)
+
+# ── База данни (Neon Postgres) ────────────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    print("ВНИМАНИЕ: Липсва DATABASE_URL — базата с членовете няма да работи!")
+
+
+def get_db_connection():
+    """Отваря нова връзка към базата. Затваряй я винаги след употреба (with)."""
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def init_db():
+    """Създава таблицата members, ако още не съществува. Извиква се веднъж при старт."""
+    if not DATABASE_URL:
+        return
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS members (
+                    email        TEXT PRIMARY KEY,
+                    name         TEXT,
+                    source       TEXT,
+                    access_code  TEXT,
+                    status       TEXT DEFAULT 'active',
+                    created_at   TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+        conn.commit()
+
+
+def upsert_member(email: str, name: str, source: str) -> None:
+    """Добавя нов член или обновява името/източника, ако имейлът вече съществува."""
+    email = (email or "").strip().lower()
+    if not email:
+        raise ValueError("Липсва имейл.")
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO members (email, name, source)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (email) DO UPDATE
+                    SET name = EXCLUDED.name,
+                        source = EXCLUDED.source
+                """,
+                (email, name, source),
+            )
+        conn.commit()
+
+
+@app.on_event("startup")
+def _on_startup():
+    try:
+        init_db()
+        print("База данни: таблицата members е готова.")
+    except Exception as e:
+        print(f"ВНИМАНИЕ: свързването с базата данни се провали при старт: {e}")
+
 
 # ── Дневни лимити (на IP / ден) ───────────────────────────────────────────
 DAILY_LIMIT_ANALYZE = 100  # AI преименувания, дневен лимит
@@ -280,3 +343,42 @@ async def upscale_image(req: UpscaleRequest, request: Request):
 
     remaining = increment("upscale", ip)
     return {"url": url, "remaining": remaining}
+
+# ── Проверка на базата данни ──────────────────────────────────────────────
+@app.get("/db-check")
+def db_check():
+    """Прост тест: свързва се с базата и връща броя членове вътре."""
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM members")
+                count = cur.fetchone()[0]
+        return {"database": "ok", "members_count": count}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Връзката с базата се провали: {str(e)}")
+
+
+# ── Zapier webhook от Skool (New Paid Member) ─────────────────────────────
+class SkoolWebhookRequest(BaseModel):
+    email: str
+    name:  str = ""
+
+
+@app.post("/skool-webhook")
+def skool_webhook(req: SkoolWebhookRequest, request: Request):
+    """
+    Адрес, който Zapier вика при всеки нов платен член в Skool.
+    Пази/обновява записа в таблицата members.
+    """
+    check_access(request)
+    try:
+        upsert_member(req.email, req.name, "skool")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при запис в базата: {str(e)}")
+
+    return {"status": "ok", "email": req.email.strip().lower()}
+
