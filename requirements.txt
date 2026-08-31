@@ -4,3 +4,4 @@ anthropic==0.121.0
 pydantic==2.9.2
 replicate>=1.0.4,<2
 psycopg2-binary==2.9.9
+requests==2.32.3
