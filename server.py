@@ -1,21 +1,31 @@
 """
-Smart Name Tool — Backend сървър
-Проксира заявките към Anthropic, пази API ключа скрит,
-налага лимит от 100 AI анализа на ден на потребител.
+AI Работилница — Backend сървър
+Проксира заявките към Anthropic (Smart Name Tool) и Replicate (AI Upscaler),
+пази API ключовете скрити и налага дневни лимити на потребител.
+
+Environment variables:
+  ANTHROPIC_API_KEY   — за Smart Name Tool (/analyze)
+  REPLICATE_API_TOKEN — за AI Upscaler (/upscale)
+  ACCESS_CODE         — по избор; ако е зададен, всяка заявка изисква
+                        header "X-Access-Code" със същата стойност
 """
 
+import asyncio
+import base64
+import io
 import os
 import re
 from datetime import date
 from collections import defaultdict
 
 import anthropic
+import replicate
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ── Приложение ────────────────────────────────────────────────────────────
-app = FastAPI(title="Smart Name Tool API", version="1.0")
+app = FastAPI(title="AI Rabotilnica API", version="2.0")
 
 # CORS — разрешава заявки от всеки сайт (systeme.io, локален файл и др.)
 app.add_middleware(
@@ -25,17 +35,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Anthropic клиент ──────────────────────────────────────────────────────
+# ── API клиенти ───────────────────────────────────────────────────────────
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 if not API_KEY:
     print("ВНИМАНИЕ: Липсва ANTHROPIC_API_KEY в environment variables!")
 
+REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
+if not REPLICATE_TOKEN:
+    print("ВНИМАНИЕ: Липсва REPLICATE_API_TOKEN — /upscale няма да работи!")
+
+ACCESS_CODE = os.environ.get("ACCESS_CODE", "")
+
 claude = anthropic.Anthropic(api_key=API_KEY)
 
-# ── Дневен лимит (100 анализа / IP / ден) ────────────────────────────────
-DAILY_LIMIT = 100
-# { "192.168.1.1": {"date": "2026-05-20", "count": 45} }
-_counts: dict = defaultdict(lambda: {"date": "", "count": 0})
+# ── Дневни лимити (на IP / ден) ───────────────────────────────────────────
+DAILY_LIMIT_ANALYZE = 100  # AI преименувания, дневен лимит
+DAILY_LIMIT_UPSCALE = 30   # AI upscale, дневен лимит, стига за един пакет
+
+# { "analyze": { "192.168.1.1": {"date": "2026-07-15", "count": 45} } }
+_counts: dict = {
+    "analyze": defaultdict(lambda: {"date": "", "count": 0}),
+    "upscale": defaultdict(lambda: {"date": "", "count": 0}),
+}
+_limits = {"analyze": DAILY_LIMIT_ANALYZE, "upscale": DAILY_LIMIT_UPSCALE}
 
 
 def get_ip(request: Request) -> str:
@@ -46,25 +68,46 @@ def get_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def remaining_for(ip: str) -> int:
-    """Връща броя оставащи анализи за днес за този IP."""
-    today = str(date.today())
-    data  = _counts[ip]
-    if data["date"] != today:
-        data["date"]  = today
+def check_access(request: Request) -> None:
+    """Ако ACCESS_CODE е зададен, изисква валиден X-Access-Code header."""
+    if ACCESS_CODE and request.headers.get("X-Access-Code", "") != ACCESS_CODE:
+        raise HTTPException(
+            status_code=401,
+            detail="Невалиден код за достъп. Вземи го от членската зона."
+        )
+
+
+# И двата инструмента се броят на дневна база, за да могат хората да
+# минат цял пакет изображения наведнъж, без да чакат месец.
+_PERIOD_KIND = {"analyze": "daily", "upscale": "daily"}
+
+
+def _period_key(kind: str) -> str:
+    if _PERIOD_KIND.get(kind) == "monthly":
+        today = date.today()
+        return f"{today.year}-{today.month:02d}"
+    return str(date.today())
+
+
+def remaining_for(kind: str, ip: str) -> int:
+    """Връща броя оставащи заявки за текущия период (ден или месец) за този IP."""
+    period = _period_key(kind)
+    data   = _counts[kind][ip]
+    if data["date"] != period:
+        data["date"]  = period
         data["count"] = 0
-    return max(0, DAILY_LIMIT - data["count"])
+    return max(0, _limits[kind] - data["count"])
 
 
-def increment(ip: str) -> int:
-    """Добавя 1 към брояча и връща оставащите."""
-    today = str(date.today())
-    data  = _counts[ip]
-    if data["date"] != today:
-        data["date"]  = today
+def increment(kind: str, ip: str) -> int:
+    """Добавя 1 към брояча и връща оставащите за текущия период."""
+    period = _period_key(kind)
+    data   = _counts[kind][ip]
+    if data["date"] != period:
+        data["date"]  = period
         data["count"] = 0
     data["count"] += 1
-    return max(0, DAILY_LIMIT - data["count"])
+    return max(0, _limits[kind] - data["count"])
 
 
 def slugify(text: str) -> str:
@@ -82,39 +125,61 @@ class AnalyzeRequest(BaseModel):
     prefix:     str = ""
 
 
+class UpscaleRequest(BaseModel):
+    image_b64:    str
+    media_type:   str          # "image/png" или "image/jpeg"
+    scale:        int  = 4     # 2 или 4
+    face_enhance: bool = False # включи за портрети/карикатури
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "Smart Name Tool API", "version": "1.0"}
+    return {"status": "ok", "app": "AI Rabotilnica API", "version": "2.0"}
 
 
 @app.get("/limit")
 def get_limit(request: Request):
-    """Връща колко AI анализа са останали за днес за този потребител."""
-    ip  = get_ip(request)
-    rem = remaining_for(ip)
-    return {"remaining": rem, "limit": DAILY_LIMIT}
+    """Връща оставащите заявки за днес за този потребител (двата брояча)."""
+    ip = get_ip(request)
+    return {
+        # запазени имена за съвместимост със Smart Name Tool
+        "remaining": remaining_for("analyze", ip),
+        "limit":     DAILY_LIMIT_ANALYZE,
+        # нови полета за AI Upscaler
+        "upscale_remaining": remaining_for("upscale", ip),
+        "upscale_limit":     DAILY_LIMIT_UPSCALE,
+    }
 
 
 @app.post("/analyze")
 async def analyze_image(req: AnalyzeRequest, request: Request):
     """
     Приема base64 изображение, праща го към Claude,
-    връща SEO-оптимизирано файлово ime.
+    връща SEO-оптимизирано файлово име.
     """
+    check_access(request)
     ip  = get_ip(request)
-    rem = remaining_for(ip)
+    rem = remaining_for("analyze", ip)
 
     if rem <= 0:
         raise HTTPException(
             status_code=429,
-            detail=f"Дневният лимит от {DAILY_LIMIT} AI анализа е достигнат. Опитай утре."
+            detail=f"Дневният лимит от {DAILY_LIMIT_ANALYZE} AI анализа е достигнат. Опитай утре."
         )
 
     prefix_note = f'Start with prefix "{slugify(req.prefix)}-".' if req.prefix else ""
 
-    try:
-        message = claude.messages.create(
+    # Пазим сървъра от прекалено големи изображения (клиентът вече ги смалява
+    # преди изпращане, това е допълнителна защита при стар кеширан клиент).
+    if len(req.image_b64) > 8 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Изображението е твърде голямо за анализ. Презареди страницата и опитай пак."
+        )
+
+    def _call_claude():
+        return claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=64,
             messages=[{
@@ -141,10 +206,77 @@ async def analyze_image(req: AnalyzeRequest, request: Request):
                 ],
             }],
         )
+
+    try:
+        # Изпълнява се в отделна нишка, за да не блокира сървъра, докато
+        # чака Claude, точно както при AI Upscaler-а. Иначе при няколко
+        # едновременни потребителки заявките се редят една зад друга и
+        # изтичат по време, преди Claude изобщо да е отговорил.
+        message = await asyncio.to_thread(_call_claude)
     except anthropic.APIError as e:
         raise HTTPException(status_code=502, detail=f"Claude API грешка: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Неочаквана грешка: {str(e)}")
 
     name      = slugify(message.content[0].text.strip())
-    remaining = increment(ip)
+    remaining = increment("analyze", ip)
 
     return {"name": name, "remaining": remaining}
+
+
+# ── AI Upscaler ───────────────────────────────────────────────────────────
+UPSCALE_MODEL   = "nightmareai/real-esrgan"
+MAX_INPUT_BYTES = 25 * 1024 * 1024   # 25 MB вход
+
+
+def _run_upscale(image_bytes: bytes, scale: int, face_enhance: bool) -> str:
+    """Блокиращо извикване към Replicate — върти се в отделна нишка."""
+    output = replicate.run(
+        UPSCALE_MODEL,
+        input={
+            "image":        io.BytesIO(image_bytes),
+            "scale":        scale,
+            "face_enhance": face_enhance,
+        },
+    )
+    # Новият replicate клиент връща FileOutput, старият — string URL
+    return getattr(output, "url", None) or str(output)
+
+
+@app.post("/upscale")
+async def upscale_image(req: UpscaleRequest, request: Request):
+    """
+    Приема base64 изображение, праща го към Real-ESRGAN на Replicate,
+    връща URL към увеличения резултат (валиден ~1 час — свали го веднага).
+    """
+    check_access(request)
+
+    if not REPLICATE_TOKEN:
+        raise HTTPException(status_code=503, detail="Upscale услугата не е конфигурирана.")
+
+    if req.scale not in (2, 4):
+        raise HTTPException(status_code=400, detail="scale трябва да е 2 или 4.")
+
+    ip  = get_ip(request)
+    rem = remaining_for("upscale", ip)
+    if rem <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Дневният лимит от {DAILY_LIMIT_UPSCALE} AI увеличения е достигнат. Опитай утре, или си вземи добавка (top-up)."
+        )
+
+    try:
+        image_bytes = base64.b64decode(req.image_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Невалиден base64 вход.")
+
+    if len(image_bytes) > MAX_INPUT_BYTES:
+        raise HTTPException(status_code=413, detail="Файлът надвишава 25 MB.")
+
+    try:
+        url = await asyncio.to_thread(_run_upscale, image_bytes, req.scale, req.face_enhance)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Replicate грешка: {str(e)}")
+
+    remaining = increment("upscale", ip)
+    return {"url": url, "remaining": remaining}
