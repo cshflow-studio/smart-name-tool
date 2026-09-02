@@ -385,17 +385,34 @@ MAX_INPUT_BYTES = 25 * 1024 * 1024   # 25 MB вход
 
 
 def _run_upscale(image_bytes: bytes, scale: int, face_enhance: bool) -> str:
-    """Блокиращо извикване към Replicate — върти се в отделна нишка."""
-    output = replicate.run(
-        UPSCALE_MODEL,
-        input={
-            "image":        io.BytesIO(image_bytes),
-            "scale":        scale,
-            "face_enhance": face_enhance,
-        },
-    )
-    # Новият replicate клиент връща FileOutput, старият — string URL
-    return getattr(output, "url", None) or str(output)
+    """Блокиращо извикване към Replicate — върти се в отделна нишка.
+
+    При натоварен трафик Replicate връща 429 (throttled) и предлага
+    да опитаме пак след няколко секунди. Правим точно това — до 5 опита
+    с нарастваща пауза, вместо да връщаме грешка на потребителя веднага.
+    """
+    max_attempts = 5
+    delay = 3  # секунди, нараства с всеки неуспешен опит
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            output = replicate.run(
+                UPSCALE_MODEL,
+                input={
+                    "image":        io.BytesIO(image_bytes),
+                    "scale":        scale,
+                    "face_enhance": face_enhance,
+                },
+            )
+            # Новият replicate клиент връща FileOutput, старият — string URL
+            return getattr(output, "url", None) or str(output)
+        except Exception as e:
+            is_throttled = "429" in str(e) or "throttled" in str(e).lower()
+            if is_throttled and attempt < max_attempts:
+                time.sleep(delay)
+                delay += 2
+                continue
+            raise
 
 
 @app.post("/upscale")
