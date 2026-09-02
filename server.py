@@ -407,8 +407,11 @@ def _run_upscale(image_bytes: bytes, scale: int, face_enhance: bool) -> str:
             # Новият replicate клиент връща FileOutput, старият — string URL
             return getattr(output, "url", None) or str(output)
         except Exception as e:
-            is_throttled = "429" in str(e) or "throttled" in str(e).lower()
-            if is_throttled and attempt < max_attempts:
+            error_text = str(e).lower()
+            is_throttled = "429" in error_text or "throttled" in error_text
+            is_oom = "out of memory" in error_text or "cuda" in error_text
+            is_retryable = is_throttled or is_oom
+            if is_retryable and attempt < max_attempts:
                 time.sleep(delay)
                 delay += 2
                 continue
