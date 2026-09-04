@@ -456,6 +456,25 @@ async def upscale_image(req: UpscaleRequest, request: Request):
     remaining = increment("upscale", ip)
     return {"url": url, "remaining": remaining}
 
+# ── Търсене на член по име (за проверка от Цвета) ─────────────────────────
+@app.get("/find-member")
+def find_member(q: str):
+    """Търси членове по част от името или имейла (без значение главни/малки букви)."""
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT email, name, status FROM members WHERE name ILIKE %s OR email ILIKE %s LIMIT 20",
+                    (f"%{q}%", f"%{q}%"),
+                )
+                rows = cur.fetchall()
+        return {"query": q, "matches": rows}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при търсене: {str(e)}")
+
+
 # ── Проверка на базата данни ──────────────────────────────────────────────
 @app.get("/db-check")
 def db_check():
