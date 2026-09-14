@@ -53,6 +53,10 @@ if not REPLICATE_TOKEN:
 
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "")
 
+# Отделен код само за управление на промпт библиотеката (добавяне/изтриване).
+# Различен от ACCESS_CODE, за да не могат обикновените членки да качват промптове.
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
+
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 if not RESEND_API_KEY:
     print("ВНИМАНИЕ: Липсва RESEND_API_KEY — изпращането на кодове за вход няма да работи!")
@@ -96,6 +100,20 @@ def init_db():
             )
             cur.execute(
                 "ALTER TABLE members ADD COLUMN IF NOT EXISTS access_code_expires TIMESTAMPTZ"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prompts (
+                    id           SERIAL PRIMARY KEY,
+                    title        TEXT NOT NULL,
+                    category     TEXT NOT NULL,
+                    ai_tool      TEXT,
+                    tags         TEXT,
+                    prompt_text  TEXT NOT NULL,
+                    image_data   TEXT,
+                    created_at   TIMESTAMPTZ DEFAULT now()
+                )
+                """
             )
         conn.commit()
 
@@ -230,6 +248,12 @@ def check_access(request: Request) -> None:
             status_code=401,
             detail="Невалиден код за достъп. Вземи го от членската зона."
         )
+
+
+def check_admin(request: Request) -> None:
+    """Изисква валиден X-Admin-Key header — само Цвета управлява промпт библиотеката."""
+    if not ADMIN_KEY or request.headers.get("X-Admin-Key", "") != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Невалиден администраторски ключ.")
 
 
 # И двата инструмента се броят на дневна база, за да могат хората да
@@ -456,25 +480,6 @@ async def upscale_image(req: UpscaleRequest, request: Request):
     remaining = increment("upscale", ip)
     return {"url": url, "remaining": remaining}
 
-# ── Търсене на член по име (за проверка от Цвета) ─────────────────────────
-@app.get("/find-member")
-def find_member(q: str):
-    """Търси членове по част от името или имейла (без значение главни/малки букви)."""
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT email, name, status FROM members WHERE name ILIKE %s OR email ILIKE %s LIMIT 20",
-                    (f"%{q}%", f"%{q}%"),
-                )
-                rows = cur.fetchall()
-        return {"query": q, "matches": rows}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Грешка при търсене: {str(e)}")
-
-
 # ── Проверка на базата данни ──────────────────────────────────────────────
 @app.get("/db-check")
 def db_check():
@@ -581,4 +586,81 @@ async def check_token(request: Request):
     if not email:
         raise HTTPException(status_code=401, detail="Невалиден или изтекъл достъп.")
     return {"status": "ok", "email": email}
+
+
+# ── Промпт библиотека ──────────────────────────────────────────────────────
+class PromptIn(BaseModel):
+    title:       str
+    category:    str
+    ai_tool:     str = ""
+    tags:        str = ""   # с запетая, напр. "etsy, seo, тагове"
+    prompt_text: str
+    image_data:  str = ""   # base64 data URL, по избор
+
+
+@app.get("/prompts")
+def list_prompts(request: Request):
+    """Връща всички промптове от библиотеката. Изисква същия членски код за достъп."""
+    check_access(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, title, category, ai_tool, tags, prompt_text, image_data, created_at "
+                    "FROM prompts ORDER BY category, title"
+                )
+                rows = cur.fetchall()
+        return {"prompts": rows}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при четене на промптовете: {str(e)}")
+
+
+@app.post("/prompts")
+def add_prompt(req: PromptIn, request: Request):
+    """Добавя нов промпт в библиотеката. Само с администраторски ключ (Цвета)."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    if not req.title.strip() or not req.category.strip() or not req.prompt_text.strip():
+        raise HTTPException(status_code=400, detail="Заглавие, категория и текст на промпта са задължителни.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO prompts (title, category, ai_tool, tags, prompt_text, image_data)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (req.title.strip(), req.category.strip(), req.ai_tool.strip(),
+                     req.tags.strip(), req.prompt_text.strip(), req.image_data or None),
+                )
+                new_id = cur.fetchone()["id"]
+            conn.commit()
+        return {"status": "ok", "id": new_id}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при запис: {str(e)}")
+
+
+@app.delete("/prompts/{prompt_id}")
+def delete_prompt(prompt_id: int, request: Request):
+    """Трие промпт по id. Само с администраторски ключ (Цвета)."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM prompts WHERE id = %s", (prompt_id,))
+                deleted = cur.rowcount
+            conn.commit()
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Няма промпт с този id.")
+        return {"status": "ok", "id": prompt_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при изтриване: {str(e)}")
 
