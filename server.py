@@ -107,10 +107,28 @@ def init_db():
                     id           SERIAL PRIMARY KEY,
                     title        TEXT NOT NULL,
                     category     TEXT NOT NULL,
-                    ai_tool      TEXT,
                     tags         TEXT,
                     prompt_text  TEXT NOT NULL,
+                    note         TEXT,
+                    created_at   TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+            # Стари инсталации може да имат ai_tool/image_data колони от по-ранна
+            # версия на схемата — вече не се ползват, резултатите живеят в
+            # отделната таблица prompt_results (един промпт → много резултати).
+            cur.execute(
+                "ALTER TABLE prompts ADD COLUMN IF NOT EXISTS note TEXT"
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prompt_results (
+                    id           SERIAL PRIMARY KEY,
+                    prompt_id    INTEGER NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+                    ai_tool      TEXT NOT NULL,
                     image_data   TEXT,
+                    rating       TEXT,
+                    sort_order   INTEGER DEFAULT 0,
                     created_at   TIMESTAMPTZ DEFAULT now()
                 )
                 """
@@ -589,37 +607,68 @@ async def check_token(request: Request):
 
 
 # ── Промпт библиотека ──────────────────────────────────────────────────────
+# Един промпт (prompts) може да има няколко резултата от различни AI
+# инструменти (prompt_results) — напр. същия промпт, изпробван в Midjourney,
+# ChatGPT и Nano Banana, всеки със своя снимка за сваляне.
+
+class PromptResultIn(BaseModel):
+    ai_tool:    str
+    image_data: str = ""   # base64 data URL, по избор
+    rating:     str = ""   # по избор, напр. "4.5" или кратък коментар
+
+
 class PromptIn(BaseModel):
     title:       str
     category:    str
-    ai_tool:     str = ""
     tags:        str = ""   # с запетая, напр. "etsy, seo, тагове"
     prompt_text: str
-    image_data:  str = ""   # base64 data URL, по избор
+    note:        str = ""   # по избор, напр. настройки за конкретен инструмент
+    results:     list[PromptResultIn] = []
+
+
+def _fetch_prompts(where_sql: str = "", params: tuple = ()) -> list[dict]:
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT id, title, category, tags, prompt_text, note, created_at "
+                f"FROM prompts {where_sql} ORDER BY category, title",
+                params,
+            )
+            prompts = cur.fetchall()
+            if not prompts:
+                return []
+            ids = tuple(p["id"] for p in prompts)
+            cur.execute(
+                "SELECT id, prompt_id, ai_tool, image_data, rating "
+                "FROM prompt_results WHERE prompt_id = ANY(%s) "
+                "ORDER BY sort_order, id",
+                (list(ids),),
+            )
+            results_by_prompt: dict = {}
+            for r in cur.fetchall():
+                results_by_prompt.setdefault(r["prompt_id"], []).append(
+                    {"id": r["id"], "ai_tool": r["ai_tool"], "image_data": r["image_data"], "rating": r["rating"]}
+                )
+            for p in prompts:
+                p["results"] = results_by_prompt.get(p["id"], [])
+            return prompts
 
 
 @app.get("/prompts")
 def list_prompts(request: Request):
-    """Връща всички промптове от библиотеката. Изисква същия членски код за достъп."""
+    """Връща всички промптове от библиотеката, всеки с всичките си AI резултати. Изисква членски код за достъп."""
     check_access(request)
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
     try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, title, category, ai_tool, tags, prompt_text, image_data, created_at "
-                    "FROM prompts ORDER BY category, title"
-                )
-                rows = cur.fetchall()
-        return {"prompts": rows}
+        return {"prompts": _fetch_prompts()}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Грешка при четене на промптовете: {str(e)}")
 
 
 @app.post("/prompts")
 def add_prompt(req: PromptIn, request: Request):
-    """Добавя нов промпт в библиотеката. Само с администраторски ключ (Цвета)."""
+    """Добавя нов промпт (с по избор няколко AI резултата) в библиотеката. Само с администраторски ключ (Цвета)."""
     check_admin(request)
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
@@ -630,14 +679,24 @@ def add_prompt(req: PromptIn, request: Request):
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    INSERT INTO prompts (title, category, ai_tool, tags, prompt_text, image_data)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO prompts (title, category, tags, prompt_text, note)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id
                     """,
-                    (req.title.strip(), req.category.strip(), req.ai_tool.strip(),
-                     req.tags.strip(), req.prompt_text.strip(), req.image_data or None),
+                    (req.title.strip(), req.category.strip(), req.tags.strip(),
+                     req.prompt_text.strip(), req.note.strip() or None),
                 )
                 new_id = cur.fetchone()["id"]
+                for i, r in enumerate(req.results):
+                    if not r.ai_tool.strip():
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO prompt_results (prompt_id, ai_tool, image_data, rating, sort_order)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (new_id, r.ai_tool.strip(), r.image_data or None, r.rating.strip() or None, i),
+                    )
             conn.commit()
         return {"status": "ok", "id": new_id}
     except Exception as e:
@@ -646,7 +705,7 @@ def add_prompt(req: PromptIn, request: Request):
 
 @app.delete("/prompts/{prompt_id}")
 def delete_prompt(prompt_id: int, request: Request):
-    """Трие промпт по id. Само с администраторски ключ (Цвета)."""
+    """Трие промпт по id, заедно с всичките му AI резултати. Само с администраторски ключ (Цвета)."""
     check_admin(request)
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
