@@ -101,6 +101,12 @@ def init_db():
             cur.execute(
                 "ALTER TABLE members ADD COLUMN IF NOT EXISTS access_code_expires TIMESTAMPTZ"
             )
+            # access_until — по избор дата, до която достъпът важи. Ако е зададена
+            # и е в миналото, членът се третира като неактивен автоматично,
+            # без някой да трябва да го маха ръчно в деня на изтичане на абонамента.
+            cur.execute(
+                "ALTER TABLE members ADD COLUMN IF NOT EXISTS access_until TIMESTAMPTZ"
+            )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS prompts (
@@ -163,6 +169,48 @@ def get_member(email: str):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM members WHERE email = %s", (email,))
             return cur.fetchone()
+
+
+def member_is_active(member) -> bool:
+    """Проверява дали член има право на достъп точно сега: статус 'active' и,
+    ако е зададен access_until, той все още не е отминал. Ползва се на всяко
+    място, където проверяваме достъп — иначе изключен член със стар токен
+    или все още незаявен код би могъл да продължи да влиза."""
+    if not member or member.get("status") != "active":
+        return False
+    access_until = member.get("access_until")
+    if access_until and access_until < datetime.now(timezone.utc):
+        return False
+    return True
+
+
+def list_members_db():
+    """Връща всички членове, подредени по имейл, за административния преглед."""
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT email, name, source, status, access_until, created_at "
+                "FROM members ORDER BY email"
+            )
+            return cur.fetchall()
+
+
+def update_member_access(email: str, status: str, access_until) -> bool:
+    """Задава статус и срок на достъп на съществуващ член.
+    access_until е None, когато не искаме краен срок отделно от статуса
+    (достъпът важи, докато статусът е 'active'), или конкретна дата/час,
+    след който достъпът пада автоматично дори статусът да е останал 'active'.
+    Връща False, ако имейлът не е намерен в таблицата."""
+    email = (email or "").strip().lower()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE members SET status = %s, access_until = %s WHERE email = %s",
+                (status, access_until, email),
+            )
+            updated = cur.rowcount
+        conn.commit()
+        return bool(updated)
 
 
 def set_login_code(email: str, code: str, expires_minutes: int = 15) -> None:
@@ -555,7 +603,7 @@ async def request_code(req: RequestCodeRequest):
         raise HTTPException(status_code=400, detail="Невалиден имейл.")
 
     member = await asyncio.to_thread(get_member, email)
-    if not member or member.get("status") != "active":
+    if not member_is_active(member):
         raise HTTPException(
             status_code=404,
             detail="Този имейл не е в списъка с членове на общността."
@@ -579,7 +627,7 @@ async def verify_code(req: VerifyCodeRequest):
     code  = (req.code or "").strip()
 
     member = await asyncio.to_thread(get_member, email)
-    if not member:
+    if not member_is_active(member):
         raise HTTPException(status_code=404, detail="Не е намерен член с този имейл.")
 
     stored_code = member.get("access_code")
@@ -597,13 +645,76 @@ async def verify_code(req: VerifyCodeRequest):
 
 @app.post("/check-token")
 async def check_token(request: Request):
-    """Проверява дали токен за достъп все още е валиден (за защитените страници)."""
+    """Проверява дали токен за достъп все още е валиден и членството е активно
+    (за защитените страници). Проверката на членството тук е важна — иначе
+    човек с вече запазен токен би запазил достъп до 30 дни, дори след като
+    бъде изключен от общността."""
     body  = await request.json()
     token = (body or {}).get("token", "")
     email = verify_access_token(token)
     if not email:
         raise HTTPException(status_code=401, detail="Невалиден или изтекъл достъп.")
+
+    member = await asyncio.to_thread(get_member, email)
+    if not member_is_active(member):
+        raise HTTPException(status_code=401, detail="Невалиден или изтекъл достъп.")
+
     return {"status": "ok", "email": email}
+
+
+# ── Управление на членове (само за Цвета) ──────────────────────────────────
+# Позволява да се вижда списъкът с членове и да се изключва/връща достъп на
+# конкретен човек, включително с автоматично изтичане на дадена дата — без да
+# се пипа директно базата данни всеки път, когато някой напусне общността.
+
+class MemberAccessIn(BaseModel):
+    email: str
+    status: str = "active"        # "active" или "inactive"
+    access_until: str | None = None  # ISO дата/час, напр. "2026-10-07T00:00:00Z"; по избор
+
+
+@app.get("/members")
+def get_members(request: Request):
+    """Връща всички членове със статус и срок на достъп. Само с администраторски ключ."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        return {"members": list_members_db()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при четене на членовете: {str(e)}")
+
+
+@app.post("/members/access")
+def set_member_access(req: MemberAccessIn, request: Request):
+    """Задава статус ('active'/'inactive') и по избор дата, до която достъпът
+    важи, на съществуващ член. Ако access_until е зададена, достъпът пада сам
+    след нея, дори статусът да е останал 'active' — удобно за хора с даден
+    гратисен период преди изключване. Само с администраторски ключ."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+
+    status = (req.status or "").strip().lower()
+    if status not in ("active", "inactive"):
+        raise HTTPException(status_code=400, detail="status трябва да е 'active' или 'inactive'.")
+
+    access_until = None
+    if req.access_until:
+        try:
+            access_until = datetime.fromisoformat(req.access_until.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Невалиден формат на access_until.")
+
+    try:
+        found = update_member_access(req.email, status, access_until)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при запис: {str(e)}")
+
+    if not found:
+        raise HTTPException(status_code=404, detail="Няма член с този имейл.")
+
+    return {"status": "ok", "email": req.email.strip().lower(), "member_status": status, "access_until": req.access_until}
 
 
 # ── Промпт библиотека ──────────────────────────────────────────────────────
