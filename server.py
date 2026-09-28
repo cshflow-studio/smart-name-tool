@@ -139,7 +139,48 @@ def init_db():
                 )
                 """
             )
+            # Статистика колко пъти е отварян/ползван всеки инструмент в hub-а —
+            # захранва графиката в административния дашборд.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tool_usage (
+                    id           SERIAL PRIMARY KEY,
+                    tool         TEXT NOT NULL,
+                    email        TEXT,
+                    occurred_at  TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+            # Одит журнал на административните действия върху членове — кой
+            # достъп е сменен, кога и от какво към какво, за спокойствие и
+            # проследимост.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_log (
+                    id            SERIAL PRIMARY KEY,
+                    action        TEXT NOT NULL,
+                    target_email  TEXT,
+                    detail        TEXT,
+                    performed_at  TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
         conn.commit()
+
+
+def log_admin_action(action: str, target_email: str, detail: str = "") -> None:
+    """Пише ред в одит журнала. Best-effort — грешка тук никога не бива да
+    провали основното действие (изключване/добавяне на член и т.н.)."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO admin_log (action, target_email, detail) VALUES (%s, %s, %s)",
+                    (action, (target_email or "").strip().lower(), detail or ""),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"ВНИМАНИЕ: неуспешен запис в admin_log: {e}")
 
 
 def upsert_member(email: str, name: str, source: str) -> None:
@@ -582,6 +623,8 @@ def skool_webhook(req: SkoolWebhookRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Грешка при запис в базата: {str(e)}")
 
+    log_admin_action("skool_webhook", req.email, f"name={req.name.strip() or '—'}")
+
     return {"status": "ok", "email": req.email.strip().lower()}
 
 
@@ -714,7 +757,127 @@ def set_member_access(req: MemberAccessIn, request: Request):
     if not found:
         raise HTTPException(status_code=404, detail="Няма член с този имейл.")
 
+    log_admin_action(
+        "set_access",
+        req.email,
+        f"status={status}, access_until={req.access_until or '—'}",
+    )
+
     return {"status": "ok", "email": req.email.strip().lower(), "member_status": status, "access_until": req.access_until}
+
+
+class MemberAddIn(BaseModel):
+    email: str
+    name: str = ""
+
+
+@app.post("/members/add")
+def add_member(req: MemberAddIn, request: Request):
+    """Ръчно добавя нов член (или обновява името, ако имейлът вече съществува),
+    със статус 'active' и без ограничение на достъпа. За случаите, когато
+    някой плати извън обичайния път през Skool и не мине автоматично.
+    Само с администраторски ключ — отделен endpoint от /skool-webhook, за да
+    не се налага да се споделя ACCESS_CODE с дашборда."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+
+    email = (req.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Невалиден имейл.")
+
+    try:
+        upsert_member(email, (req.name or "").strip(), "ръчно добавен")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при запис: {str(e)}")
+
+    log_admin_action("add_member", email, f"name={req.name.strip() or '—'}")
+
+    return {"status": "ok", "email": email}
+
+
+# ── Статистика за употреба и одит журнал ────────────────────────────────────
+
+class TrackIn(BaseModel):
+    tool: str
+    email: str = ""
+
+
+@app.post("/track")
+def track_usage(req: TrackIn, request: Request):
+    """Записва едно отваряне/ползване на инструмент от hub-а. Изисква
+    членски код за достъп (същият, който пазят другите публични endpoint-и),
+    но не е администраторски — всеки инструмент го вика тихо на зареждане."""
+    check_access(request)
+    if not DATABASE_URL:
+        return {"status": "skipped"}
+    tool = (req.tool or "").strip()
+    if not tool:
+        raise HTTPException(status_code=400, detail="Липсва tool.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO tool_usage (tool, email) VALUES (%s, %s)",
+                    (tool, (req.email or "").strip().lower() or None),
+                )
+            conn.commit()
+    except Exception as e:
+        # Никога не бива broken статистика да чупи самия инструмент.
+        print(f"ВНИМАНИЕ: неуспешен запис в tool_usage: {e}")
+    return {"status": "ok"}
+
+
+@app.get("/admin/stats")
+def get_stats(request: Request):
+    """Обобщена статистика за употреба по инструмент — общо и последните 30
+    дни, плюс дневна разбивка за графиката в дашборда. Само с администраторски ключ."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT tool, COUNT(*) AS total "
+                    "FROM tool_usage GROUP BY tool ORDER BY total DESC"
+                )
+                by_tool = cur.fetchall()
+                cur.execute(
+                    "SELECT tool, COUNT(*) AS total FROM tool_usage "
+                    "WHERE occurred_at >= now() - interval '30 days' "
+                    "GROUP BY tool ORDER BY total DESC"
+                )
+                by_tool_30d = cur.fetchall()
+                cur.execute(
+                    "SELECT tool, DATE(occurred_at) AS day, COUNT(*) AS total "
+                    "FROM tool_usage WHERE occurred_at >= now() - interval '30 days' "
+                    "GROUP BY tool, DATE(occurred_at) ORDER BY day"
+                )
+                daily = cur.fetchall()
+        return {"by_tool": by_tool, "by_tool_30d": by_tool_30d, "daily": daily}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при четене на статистиката: {str(e)}")
+
+
+@app.get("/admin/log")
+def get_admin_log(request: Request):
+    """Последните действия по членове — кой е изключен/активиран/добавен,
+    кога и с какви детайли. Само с администраторски ключ."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT action, target_email, detail, performed_at FROM admin_log "
+                    "ORDER BY performed_at DESC LIMIT 200"
+                )
+                rows = cur.fetchall()
+        return {"log": rows}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при четене на журнала: {str(e)}")
 
 
 # ── Промпт библиотека ──────────────────────────────────────────────────────
