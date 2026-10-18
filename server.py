@@ -101,12 +101,6 @@ def init_db():
             cur.execute(
                 "ALTER TABLE members ADD COLUMN IF NOT EXISTS access_code_expires TIMESTAMPTZ"
             )
-            # access_until — по избор дата, до която достъпът важи. Ако е зададена
-            # и е в миналото, членът се третира като неактивен автоматично,
-            # без някой да трябва да го маха ръчно в деня на изтичане на абонамента.
-            cur.execute(
-                "ALTER TABLE members ADD COLUMN IF NOT EXISTS access_until TIMESTAMPTZ"
-            )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS prompts (
@@ -139,48 +133,7 @@ def init_db():
                 )
                 """
             )
-            # Статистика колко пъти е отварян/ползван всеки инструмент в hub-а —
-            # захранва графиката в административния дашборд.
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tool_usage (
-                    id           SERIAL PRIMARY KEY,
-                    tool         TEXT NOT NULL,
-                    email        TEXT,
-                    occurred_at  TIMESTAMPTZ DEFAULT now()
-                )
-                """
-            )
-            # Одит журнал на административните действия върху членове — кой
-            # достъп е сменен, кога и от какво към какво, за спокойствие и
-            # проследимост.
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS admin_log (
-                    id            SERIAL PRIMARY KEY,
-                    action        TEXT NOT NULL,
-                    target_email  TEXT,
-                    detail        TEXT,
-                    performed_at  TIMESTAMPTZ DEFAULT now()
-                )
-                """
-            )
         conn.commit()
-
-
-def log_admin_action(action: str, target_email: str, detail: str = "") -> None:
-    """Пише ред в одит журнала. Best-effort — грешка тук никога не бива да
-    провали основното действие (изключване/добавяне на член и т.н.)."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO admin_log (action, target_email, detail) VALUES (%s, %s, %s)",
-                    (action, (target_email or "").strip().lower(), detail or ""),
-                )
-            conn.commit()
-    except Exception as e:
-        print(f"ВНИМАНИЕ: неуспешен запис в admin_log: {e}")
 
 
 def upsert_member(email: str, name: str, source: str) -> None:
@@ -210,48 +163,6 @@ def get_member(email: str):
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM members WHERE email = %s", (email,))
             return cur.fetchone()
-
-
-def member_is_active(member) -> bool:
-    """Проверява дали член има право на достъп точно сега: статус 'active' и,
-    ако е зададен access_until, той все още не е отминал. Ползва се на всяко
-    място, където проверяваме достъп — иначе изключен член със стар токен
-    или все още незаявен код би могъл да продължи да влиза."""
-    if not member or member.get("status") != "active":
-        return False
-    access_until = member.get("access_until")
-    if access_until and access_until < datetime.now(timezone.utc):
-        return False
-    return True
-
-
-def list_members_db():
-    """Връща всички членове, подредени по имейл, за административния преглед."""
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT email, name, source, status, access_until, created_at "
-                "FROM members ORDER BY email"
-            )
-            return cur.fetchall()
-
-
-def update_member_access(email: str, status: str, access_until) -> bool:
-    """Задава статус и срок на достъп на съществуващ член.
-    access_until е None, когато не искаме краен срок отделно от статуса
-    (достъпът важи, докато статусът е 'active'), или конкретна дата/час,
-    след който достъпът пада автоматично дори статусът да е останал 'active'.
-    Връща False, ако имейлът не е намерен в таблицата."""
-    email = (email or "").strip().lower()
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE members SET status = %s, access_until = %s WHERE email = %s",
-                (status, access_until, email),
-            )
-            updated = cur.rowcount
-        conn.commit()
-        return bool(updated)
 
 
 def set_login_code(email: str, code: str, expires_minutes: int = 15) -> None:
@@ -623,8 +534,6 @@ def skool_webhook(req: SkoolWebhookRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Грешка при запис в базата: {str(e)}")
 
-    log_admin_action("skool_webhook", req.email, f"name={req.name.strip() or '—'}")
-
     return {"status": "ok", "email": req.email.strip().lower()}
 
 
@@ -646,7 +555,7 @@ async def request_code(req: RequestCodeRequest):
         raise HTTPException(status_code=400, detail="Невалиден имейл.")
 
     member = await asyncio.to_thread(get_member, email)
-    if not member_is_active(member):
+    if not member or member.get("status") != "active":
         raise HTTPException(
             status_code=404,
             detail="Този имейл не е в списъка с членове на общността."
@@ -670,7 +579,7 @@ async def verify_code(req: VerifyCodeRequest):
     code  = (req.code or "").strip()
 
     member = await asyncio.to_thread(get_member, email)
-    if not member_is_active(member):
+    if not member:
         raise HTTPException(status_code=404, detail="Не е намерен член с този имейл.")
 
     stored_code = member.get("access_code")
@@ -688,196 +597,201 @@ async def verify_code(req: VerifyCodeRequest):
 
 @app.post("/check-token")
 async def check_token(request: Request):
-    """Проверява дали токен за достъп все още е валиден и членството е активно
-    (за защитените страници). Проверката на членството тук е важна — иначе
-    човек с вече запазен токен би запазил достъп до 30 дни, дори след като
-    бъде изключен от общността."""
+    """Проверява дали токен за достъп все още е валиден (за защитените страници)."""
     body  = await request.json()
     token = (body or {}).get("token", "")
     email = verify_access_token(token)
     if not email:
         raise HTTPException(status_code=401, detail="Невалиден или изтекъл достъп.")
-
-    member = await asyncio.to_thread(get_member, email)
-    if not member_is_active(member):
-        raise HTTPException(status_code=401, detail="Невалиден или изтекъл достъп.")
-
     return {"status": "ok", "email": email}
 
 
-# ── Управление на членове (само за Цвета) ──────────────────────────────────
-# Позволява да се вижда списъкът с членове и да се изключва/връща достъп на
-# конкретен човек, включително с автоматично изтичане на дадена дата — без да
-# се пипа директно базата данни всеки път, когато някой напусне общността.
+# ── Безплатни AI снимки за лабораторията за промптове (OpenAI) ─────────────
+# Ключът живее само тук, в environment variables на сървъра. Страницата никога не го вижда.
+# Настройки (всички по избор, има разумни стойности):
+#   OPENAI_API_KEY    — ключът от platform.openai.com
+#   IMG_ENABLED       — "0" изключва услугата веднага
+#   IMG_MODEL         — име на образния модел, който акаунтът ти позволява
+#   IMG_QUALITY       — low | medium | high
+#   IMG_DAILY_USER    — генерации на човек на ден
+#   IMG_DAILY_GLOBAL  — генерации общо на ден
+#   IMG_MONTHLY_USD   — таван на изхарченото на месец, по приблизителна цена
+#   IMG_COST_USD      — приблизителна цена на една снимка (за броене, не за сметка)
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
+IMG_ENABLED      = os.environ.get("IMG_ENABLED", "1") != "0"
+IMG_MODEL        = os.environ.get("IMG_MODEL", "gpt-image-2")
+IMG_QUALITY      = os.environ.get("IMG_QUALITY", "medium")
 
-class MemberAccessIn(BaseModel):
-    email: str
-    status: str = "active"        # "active" или "inactive"
-    access_until: str | None = None  # ISO дата/час, напр. "2026-10-07T00:00:00Z"; по избор
 
-
-@app.get("/members")
-def get_members(request: Request):
-    """Връща всички членове със статус и срок на достъп. Само с администраторски ключ."""
-    check_admin(request)
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+def _env_num(name: str, default, cast):
     try:
-        return {"members": list_members_db()}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Грешка при четене на членовете: {str(e)}")
+        return cast(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return cast(default)
 
 
-@app.post("/members/access")
-def set_member_access(req: MemberAccessIn, request: Request):
-    """Задава статус ('active'/'inactive') и по избор дата, до която достъпът
-    важи, на съществуващ член. Ако access_until е зададена, достъпът пада сам
-    след нея, дори статусът да е останал 'active' — удобно за хора с даден
-    гратисен период преди изключване. Само с администраторски ключ."""
-    check_admin(request)
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+IMG_DAILY_USER   = _env_num("IMG_DAILY_USER", "3", int)
+IMG_DAILY_GLOBAL = _env_num("IMG_DAILY_GLOBAL", "30", int)
+IMG_MONTHLY_USD  = _env_num("IMG_MONTHLY_USD", "15", float)
+IMG_COST_USD     = _env_num("IMG_COST_USD", "0.07", float)
+IMG_SIZES        = {"1024x1024", "1024x1536", "1536x1024"}
+IMG_TZ           = "Europe/Sofia"
+_img_table_ready = False
 
-    status = (req.status or "").strip().lower()
-    if status not in ("active", "inactive"):
-        raise HTTPException(status_code=400, detail="status трябва да е 'active' или 'inactive'.")
 
-    access_until = None
-    if req.access_until:
-        try:
-            access_until = datetime.fromisoformat(req.access_until.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Невалиден формат на access_until.")
+def _img_table() -> None:
+    """Създава таблицата за дневника на генерациите, ако я няма."""
+    global _img_table_ready
+    if _img_table_ready:
+        return
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image_gen_log (
+                    id         SERIAL PRIMARY KEY,
+                    email      TEXT NOT NULL,
+                    cost_usd   NUMERIC(8,4) NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+        conn.commit()
+    _img_table_ready = True
 
-    try:
-        found = update_member_access(req.email, status, access_until)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Грешка при запис: {str(e)}")
 
-    if not found:
-        raise HTTPException(status_code=404, detail="Няма член с този имейл.")
-
-    log_admin_action(
-        "set_access",
-        req.email,
-        f"status={status}, access_until={req.access_until or '—'}",
+def _img_usage(cur, email: str) -> dict:
+    """Колко генерации са направени днес (от човека и общо) и колко е изхарчено този месец."""
+    cur.execute(
+        f"""
+        SELECT
+          COUNT(*) FILTER (WHERE (created_at AT TIME ZONE '{IMG_TZ}')::date = (now() AT TIME ZONE '{IMG_TZ}')::date AND email = %s),
+          COUNT(*) FILTER (WHERE (created_at AT TIME ZONE '{IMG_TZ}')::date = (now() AT TIME ZONE '{IMG_TZ}')::date),
+          COALESCE(SUM(cost_usd) FILTER (WHERE date_trunc('month', created_at AT TIME ZONE '{IMG_TZ}') = date_trunc('month', now() AT TIME ZONE '{IMG_TZ}')), 0)
+        FROM image_gen_log
+        """,
+        (email,),
     )
-
-    return {"status": "ok", "email": req.email.strip().lower(), "member_status": status, "access_until": req.access_until}
-
-
-class MemberAddIn(BaseModel):
-    email: str
-    name: str = ""
+    u, g, m = cur.fetchone()
+    return {"user": int(u or 0), "global": int(g or 0), "month": float(m or 0)}
 
 
-@app.post("/members/add")
-def add_member(req: MemberAddIn, request: Request):
-    """Ръчно добавя нов член (или обновява името, ако имейлът вече съществува),
-    със статус 'active' и без ограничение на достъпа. За случаите, когато
-    някой плати извън обичайния път през Skool и не мине автоматично.
-    Само с администраторски ключ — отделен endpoint от /skool-webhook, за да
-    не се налага да се споделя ACCESS_CODE с дашборда."""
-    check_admin(request)
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+def _img_remaining(usage: dict) -> int:
+    by_month = int((max(0.0, IMG_MONTHLY_USD - usage["month"]) + 1e-6) // max(IMG_COST_USD, 0.0001))
+    return max(0, min(IMG_DAILY_USER - usage["user"], IMG_DAILY_GLOBAL - usage["global"], by_month))
 
-    email = (req.email or "").strip().lower()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Невалиден имейл.")
+
+def _img_email(request: Request) -> str:
+    email = verify_access_token(request.headers.get("X-Token", ""))
+    if not email:
+        raise HTTPException(status_code=401, detail="Влез отново през AI Работилница, за да ползваш безплатните генерации.")
+    return email
+
+
+@app.get("/gen-image/status")
+def gen_image_status(request: Request):
+    """Казва на страницата дали услугата работи и колко генерации остават на този човек днес."""
+    email = _img_email(request)
+    if not (OPENAI_API_KEY and IMG_ENABLED and DATABASE_URL):
+        return {"enabled": False, "remaining": 0, "limit": IMG_DAILY_USER}
+    try:
+        _img_table()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                usage = _img_usage(cur, email)
+    except Exception as e:
+        print(f"gen-image status грешка: {e}")
+        return {"enabled": False, "remaining": 0, "limit": IMG_DAILY_USER}
+    return {"enabled": True, "remaining": _img_remaining(usage), "limit": IMG_DAILY_USER}
+
+
+class GenImageIn(BaseModel):
+    prompt: str
+    size: str = "1024x1536"
+
+
+def _openai_image(prompt: str, size: str) -> str:
+    """Блокиращо извикване към OpenAI. Връща data URL. Работи в отделна нишка."""
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    body = {"model": IMG_MODEL, "prompt": prompt, "size": size, "quality": IMG_QUALITY, "n": 1,
+            "output_format": "jpeg", "output_compression": 85}
+    r = requests.post("https://api.openai.com/v1/images/generations", headers=headers, json=body, timeout=150)
+    mime = "image/jpeg"
+    if r.status_code == 400 and "output_" in r.text:
+        # някои модели не знаят тези параметри, пробваме без тях
+        body.pop("output_format"); body.pop("output_compression")
+        r = requests.post("https://api.openai.com/v1/images/generations", headers=headers, json=body, timeout=150)
+        mime = "image/png"
+    if r.status_code != 200:
+        print(f"OpenAI грешка {r.status_code}: {r.text[:400]}")
+        text = r.text.lower()
+        if r.status_code == 400 and ("safety" in text or "moderation" in text or "content_policy" in text):
+            raise HTTPException(status_code=400, detail="Промптът е отхвърлен от филтъра на OpenAI. Смени думите и опитай пак.")
+        if r.status_code == 429:
+            raise HTTPException(status_code=503, detail="Услугата е заета. Опитай пак след минута.")
+        raise HTTPException(status_code=502, detail="Генерацията не успя. Опитай пак по-късно или копирай промпта в ChatGPT.")
+    b64 = (r.json().get("data") or [{}])[0].get("b64_json")
+    if not b64:
+        raise HTTPException(status_code=502, detail="OpenAI не върна снимка. Опитай пак.")
+    return f"data:{mime};base64,{b64}"
+
+
+@app.post("/gen-image")
+async def gen_image(req: GenImageIn, request: Request):
+    """Прави една снимка по промпта. Спазва дневен лимит на човек, общ дневен лимит и месечен таван."""
+    email = _img_email(request)
+    if not (OPENAI_API_KEY and IMG_ENABLED and DATABASE_URL):
+        raise HTTPException(status_code=503, detail="Безплатните генерации са изключени в момента.")
+    prompt = (req.prompt or "").strip()
+    if len(prompt) < 20 or len(prompt) > 4000:
+        raise HTTPException(status_code=400, detail="Промптът трябва да е между 20 и 4000 знака.")
+    size = req.size if req.size in IMG_SIZES else "1024x1536"
+
+    # Резервираме място в лимита, преди да платим за снимката, за да не минат две заявки наведнъж.
+    try:
+        _img_table()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("LOCK TABLE image_gen_log IN SHARE ROW EXCLUSIVE MODE")
+                usage = _img_usage(cur, email)
+                if usage["user"] >= IMG_DAILY_USER:
+                    raise HTTPException(status_code=429, detail=f"Използва всичките си {IMG_DAILY_USER} безплатни генерации за днес. Копирай промпта в ChatGPT или опитай утре.")
+                if usage["global"] >= IMG_DAILY_GLOBAL or usage["month"] + IMG_COST_USD > IMG_MONTHLY_USD + 1e-6:
+                    raise HTTPException(status_code=429, detail="Безплатните генерации за днес свършиха за всички. Копирай промпта в ChatGPT или опитай утре.")
+                cur.execute("INSERT INTO image_gen_log (email, cost_usd) VALUES (%s, %s) RETURNING id", (email, IMG_COST_USD))
+                log_id = cur.fetchone()[0]
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"gen-image база грешка: {e}")
+        raise HTTPException(status_code=503, detail="Услугата не е достъпна в момента.")
 
     try:
-        upsert_member(email, (req.name or "").strip(), "ръчно добавен")
+        image = await asyncio.to_thread(_openai_image, prompt, size)
+    except HTTPException:
+        _img_refund(log_id)
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Грешка при запис: {str(e)}")
+        print(f"gen-image грешка: {e}")
+        _img_refund(log_id)
+        raise HTTPException(status_code=502, detail="Генерацията не успя. Опитай пак по-късно.")
 
-    log_admin_action("add_member", email, f"name={req.name.strip() or '—'}")
-
-    return {"status": "ok", "email": email}
-
-
-# ── Статистика за употреба и одит журнал ────────────────────────────────────
-
-class TrackIn(BaseModel):
-    tool: str
-    email: str = ""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            usage = _img_usage(cur, email)
+    return {"image": image, "remaining": _img_remaining(usage)}
 
 
-@app.post("/track")
-def track_usage(req: TrackIn, request: Request):
-    """Записва едно отваряне/ползване на инструмент от hub-а. Изисква
-    членски код за достъп (същият, който пазят другите публични endpoint-и),
-    но не е администраторски — всеки инструмент го вика тихо на зареждане."""
-    check_access(request)
-    if not DATABASE_URL:
-        return {"status": "skipped"}
-    tool = (req.tool or "").strip()
-    if not tool:
-        raise HTTPException(status_code=400, detail="Липсва tool.")
+def _img_refund(log_id: int) -> None:
+    """Връща използваната генерация, когато OpenAI не е върнал снимка."""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO tool_usage (tool, email) VALUES (%s, %s)",
-                    (tool, (req.email or "").strip().lower() or None),
-                )
+                cur.execute("DELETE FROM image_gen_log WHERE id = %s", (log_id,))
             conn.commit()
     except Exception as e:
-        # Никога не бива broken статистика да чупи самия инструмент.
-        print(f"ВНИМАНИЕ: неуспешен запис в tool_usage: {e}")
-    return {"status": "ok"}
-
-
-@app.get("/admin/stats")
-def get_stats(request: Request):
-    """Обобщена статистика за употреба по инструмент — общо и последните 30
-    дни, плюс дневна разбивка за графиката в дашборда. Само с администраторски ключ."""
-    check_admin(request)
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT tool, COUNT(*) AS total "
-                    "FROM tool_usage GROUP BY tool ORDER BY total DESC"
-                )
-                by_tool = cur.fetchall()
-                cur.execute(
-                    "SELECT tool, COUNT(*) AS total FROM tool_usage "
-                    "WHERE occurred_at >= now() - interval '30 days' "
-                    "GROUP BY tool ORDER BY total DESC"
-                )
-                by_tool_30d = cur.fetchall()
-                cur.execute(
-                    "SELECT tool, DATE(occurred_at) AS day, COUNT(*) AS total "
-                    "FROM tool_usage WHERE occurred_at >= now() - interval '30 days' "
-                    "GROUP BY tool, DATE(occurred_at) ORDER BY day"
-                )
-                daily = cur.fetchall()
-        return {"by_tool": by_tool, "by_tool_30d": by_tool_30d, "daily": daily}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Грешка при четене на статистиката: {str(e)}")
-
-
-@app.get("/admin/log")
-def get_admin_log(request: Request):
-    """Последните действия по членове — кой е изключен/активиран/добавен,
-    кога и с какви детайли. Само с администраторски ключ."""
-    check_admin(request)
-    if not DATABASE_URL:
-        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT action, target_email, detail, performed_at FROM admin_log "
-                    "ORDER BY performed_at DESC LIMIT 200"
-                )
-                rows = cur.fetchall()
-        return {"log": rows}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Грешка при четене на журнала: {str(e)}")
+        print(f"gen-image връщане грешка: {e}")
 
 
 # ── Промпт библиотека ──────────────────────────────────────────────────────
