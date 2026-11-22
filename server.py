@@ -13,6 +13,8 @@ Environment variables:
 import asyncio
 import base64
 import io
+import json
+from typing import Optional
 import os
 import re
 from datetime import date, datetime, timezone, timedelta
@@ -331,13 +333,15 @@ def _on_startup():
 # ── Дневни лимити (на IP / ден) ───────────────────────────────────────────
 DAILY_LIMIT_ANALYZE = 100  # AI преименувания, дневен лимит
 DAILY_LIMIT_UPSCALE = 30   # AI upscale, дневен лимит, стига за един пакет
+DAILY_LIMIT_PROMPTARTIS = 60  # PromptArtis заявки, дневен лимит
 
 # { "analyze": { "192.168.1.1": {"date": "2026-07-15", "count": 45} } }
 _counts: dict = {
     "analyze": defaultdict(lambda: {"date": "", "count": 0}),
     "upscale": defaultdict(lambda: {"date": "", "count": 0}),
+    "promptartis": defaultdict(lambda: {"date": "", "count": 0}),
 }
-_limits = {"analyze": DAILY_LIMIT_ANALYZE, "upscale": DAILY_LIMIT_UPSCALE}
+_limits = {"analyze": DAILY_LIMIT_ANALYZE, "upscale": DAILY_LIMIT_UPSCALE, "promptartis": DAILY_LIMIT_PROMPTARTIS}
 
 
 def get_ip(request: Request) -> str:
@@ -365,7 +369,7 @@ def check_admin(request: Request) -> None:
 
 # И двата инструмента се броят на дневна база, за да могат хората да
 # минат цял пакет изображения наведнъж, без да чакат месец.
-_PERIOD_KIND = {"analyze": "daily", "upscale": "daily"}
+_PERIOD_KIND = {"analyze": "daily", "upscale": "daily", "promptartis": "daily"}
 
 
 def _period_key(kind: str) -> str:
@@ -508,6 +512,153 @@ async def analyze_image(req: AnalyzeRequest, request: Request):
     remaining = increment("analyze", ip)
 
     return {"name": name, "remaining": remaining}
+
+
+# ── PromptArtis: творчески асистент за промптове ─────────────────────────
+PA_SYSTEM = """You are PromptArtis, an expert AI image prompt engineer for digital product creators (Etsy sellers, print on demand, children's book makers).
+The user writes in Bulgarian. You write every prompt in ENGLISH and every explanation in BULGARIAN (short, friendly, 1 to 2 sentences, no markdown).
+Reply with ONLY valid JSON, no code fences, no extra text.
+
+GENERAL RULES
+- Never mention real artists, brands, trademarks or famous characters.
+- Prompts are plain text without markdown. One prompt is one paragraph of comma separated phrases.
+- Keep prompts 40 to 110 words. Be concrete: subject, details, style, palette, background, composition.
+- Use the given style and palette phrases when provided. If the palette is empty and the user asked to suggest one, choose a fitting palette and name its colors in the prompt.
+- If a creative card is given, keep theme, motifs, style, palette, mood and "keep" elements consistent with it.
+- Platform: for Midjourney append ONLY the aspect ratio as --ar W:H when a ratio is given, plus --tile for seamless patterns. Add no other parameters. For other platforms add no parameters.
+
+CATEGORY RULES
+- clipart: one isolated element per prompt, plain white background, clean edges, complete and fully visible, nothing cropped, no text. Never ask for a transparent background unless the user chose it. For sets write one separate prompt per element.
+- artprint: full composition with main elements, complementary elements and a frame or background, with lighting, mood and composition.
+- pattern: ALWAYS include the phrases "seamless pattern", "tileable", "repeat pattern". Describe main motifs, small filler elements, a FLAT solid or subtle texture background, palette. Opposite edges must match, motifs crossing an edge continue on the opposite edge. Consistent scale, style and colors across the tile. Never add borders, frames, vignettes, gradients or drop shadows. Add the requested layout style.
+- mockup: product, size, scene, camera angle, lighting, colors, "lifestyle product photography, professional photo". Leave the product surface blank for the user's design.
+- coloring: ALWAYS black and white line art, thick clean outlines, no shading, no gray, no color fill, white background, all elements fully visible, age and complexity appropriate.
+- kidsbook: build a CHARACTER BIBLE (name, age, hair, eyes, skin tone, clothing, defining feature, art style, consistent character design) and repeat it in full inside the scene prompt: "children's book illustration, [bible], [where and what], [mood], [time of day], [style], warm colors, soft lighting, magical atmosphere, age-appropriate".
+- planner: covers (main, complementary, frame/background, space for title) or printable inner pages (minimal design, clean lines, white background) or stickers (isolated, white border).
+- card: decorations around the outside, a large clean blank area for text, no lettering, nothing cropped.
+- tshirt: print design. Use the exact print area and orientation given in the product line. Complete artwork, nothing cropped, isolated on the chosen background, print-ready. For mugs: landscape wrap, three strict equal vertical zones (left illustration, center text only, right small accent), no solid background. If a tagline is given, put it in single quotes as text to render.
+- pack: separate prompts in 4 groups: main elements, complementary elements, frames and backgrounds, full compositions.
+- free: choose the best structure yourself.
+
+MODES (field "mode")
+- create: if an image is attached (t-shirt or mug category), turn the person or subject in the photo into a stylized illustration inside the design (for a mug: in the left zone), never a photorealistic copy. Return {"items":[{"title":"","prompt":"...","explain":"..."}]} with exactly ONE item (for clipart sets of 6 or 10 return that many items, each with a short Bulgarian title).
+- photo: a reference photo is attached. First analyze its colors, style, mood and composition. Return 5 items, each a complete English prompt with a short Bulgarian title naming the idea type: "Същия стил, нов обект", "Същата палитра", "Сезонна версия", "Безшевна шарка", "Страница за оцветяване". Do not copy a recognizable person, brand or artwork: create an original interpretation. The explain field says in Bulgarian what was taken from the photo (palette, style, mood). Respect "focus" (what the user wants changed) when given.
+- kidbible: a photo of a child is attached. Return {"fields":{"hair":"","eyes":"","skin":"","clothes":"","feat":"","gender":""}} in BULGARIAN, describing only visible appearance: hair color and style, eye color, skin: exactly one of "светъл","среден","тъмен", clothes colors and style, one defining visible feature, gender: exactly "момиче" or "момче". Never guess a name, age or location.
+- ideas: return {"ideas":["...", "...", "..."]}: 5 short Bulgarian ideas (max 14 words each) fitting the category and the user's partial text.
+- improve: improve base_prompt according to "change" (Bulgarian). Return one item.
+- variations: return 3 items, each a different variation of base_prompt (different composition, subject detail or mood) with titles "Вариант 1".."Вариант 3".
+- recolor: rewrite base_prompt with the new palette_en, keep everything else. One item.
+- collection: return "count" items per group in 4 groups, titles prefixed by group in Bulgarian: "Основни елементи", "Допълващи елементи", "Рамки и фонове", "Пълни композиции". Main and complementary groups have "count" items each, frames 3 items, compositions 3 items. All share one style and palette. Never exceed 25 items total.
+- patternset: return 4 items: "Основна шарка", "Допълваща шарка 1", "Допълваща шарка 2", "Спокойна шарка". Same palette and style, different density and motif sizes, the calm one with sparse small motifs. All follow the seamless rules.
+Each item: {"title": string, "prompt": English string, "explain": Bulgarian string}."""
+
+
+class PromptArtisIn(BaseModel):
+    mode: str = "create"
+    category: str = "free"
+    category_name: str = ""
+    idea: str = ""
+    idea_en: str = ""
+    style_en: str = ""
+    palette_en: str = ""
+    palette_name: str = ""
+    platform: str = "ChatGPT"
+    ratio: str = ""
+    fields: dict = {}
+    detail: dict = {}
+    card: Optional[dict] = None
+    easy: bool = True
+    pattern_layout_en: str = ""
+    base_prompt: str = ""
+    change: str = ""
+    count: int = 5
+    image_b64: str = ""
+
+
+def _pa_json(text: str):
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+
+@app.post("/promptartis")
+async def promptartis(req: PromptArtisIn, request: Request):
+    """Създава английски промпти с български обяснения за PromptArtis."""
+    check_access(request)
+    ip = get_ip(request)
+    if remaining_for("promptartis", ip) <= 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Дневният лимит от {DAILY_LIMIT_PROMPTARTIS} заявки към PromptArtis е достигнат. Опитай утре."
+        )
+    mode = req.mode if req.mode in ("create", "ideas", "improve", "variations", "recolor", "collection", "patternset", "photo", "kidbible") else "create"
+    if len(req.image_b64) > 4 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Снимката е твърде голяма. Качи по-малка.")
+    if mode in ("photo", "kidbible") and not req.image_b64:
+        raise HTTPException(status_code=400, detail="Липсва снимка.")
+    pd = req.dict(); pd.pop("image_b64", None)
+    total_len = len(json.dumps(pd, ensure_ascii=False))
+    if total_len > 12000:
+        raise HTTPException(status_code=413, detail="Заявката е твърде дълга. Съкрати текста.")
+    payload = pd
+    payload["mode"] = mode
+    payload["count"] = max(3, min(10, req.count))
+    user_msg = "Request data (JSON):\n" + json.dumps(payload, ensure_ascii=False)
+
+    if req.image_b64:
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": req.image_b64}},
+            {"type": "text", "text": user_msg},
+        ]
+    else:
+        content = user_msg
+
+    def _call():
+        return claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=6000 if mode in ("collection", "patternset", "variations", "photo") or "10 " in json.dumps(req.fields, ensure_ascii=False) else 2000,
+            system=PA_SYSTEM,
+            messages=[{"role": "user", "content": content}],
+        )
+
+    try:
+        message = await asyncio.to_thread(_call)
+    except anthropic.APIError as e:
+        raise HTTPException(status_code=502, detail=f"Claude API грешка: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Неочаквана грешка: {str(e)}")
+
+    try:
+        data = _pa_json(message.content[0].text)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Отговорът не беше в очаквания формат. Опитай пак.")
+
+    remaining = increment("promptartis", ip)
+    if mode == "kidbible":
+        fl = data.get("fields") or {}
+        return {"fields": {k: str(fl.get(k, ""))[:200] for k in ("hair", "eyes", "skin", "clothes", "feat", "gender")}, "remaining": remaining}
+    if mode == "ideas":
+        ideas = [str(x)[:200] for x in (data.get("ideas") or [])][:6]
+        return {"ideas": ideas, "remaining": remaining}
+    items = []
+    for it in (data.get("items") or [])[:25]:
+        if not isinstance(it, dict) or not it.get("prompt"):
+            continue
+        items.append({
+            "title":   str(it.get("title", ""))[:120],
+            "prompt":  str(it.get("prompt", ""))[:2500],
+            "explain": str(it.get("explain", ""))[:600],
+        })
+    if not items:
+        raise HTTPException(status_code=502, detail="Не получих промпт. Опитай пак.")
+    return {"items": items, "remaining": remaining}
 
 
 # ── AI Upscaler ───────────────────────────────────────────────────────────
