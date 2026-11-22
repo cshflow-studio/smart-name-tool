@@ -527,14 +527,19 @@ GENERAL RULES
 - If a creative card is given, keep theme, motifs, style, palette, mood and "keep" elements consistent with it.
 - Platform: for Midjourney append ONLY the aspect ratio as --ar W:H when a ratio is given, plus --tile for seamless patterns. Add no other parameters. For other platforms add no parameters.
 
+MASTER QUALITY
+- Write master level prompts: concrete subject, rich specific details, composition, lighting, texture, mood and finishing, 60 to 130 words, no filler.
+- Fields may include niche (niche_en gives the English term), keywords and extra. Weave the niche and keywords naturally into the prompt as concrete motifs and mood. Follow "extra" instructions exactly.
+- In the Bulgarian explain field, say which niche, format and key choices you applied.
+
 CATEGORY RULES
 - clipart: one isolated element per prompt, plain white background, clean edges, complete and fully visible, nothing cropped, no text. Never ask for a transparent background unless the user chose it. For sets write one separate prompt per element.
-- artprint: full composition with main elements, complementary elements and a frame or background, with lighting, mood and composition.
+- artprint: the field 'Формат за печат' may list several sizes sharing one aspect ratio: compose for that ratio, mention the sizes in the explain field. Also respect the chosen print format and orientation: compose for the given aspect ratio and state it in words as "N:M aspect ratio" and "vertical portrait / horizontal landscape / square composition" in the prompt. Full composition with main elements, complementary elements and a frame or background, with lighting, mood and composition.
 - pattern: ALWAYS include the phrases "seamless pattern", "tileable", "repeat pattern". Describe main motifs, small filler elements, a FLAT solid or subtle texture background, palette. Opposite edges must match, motifs crossing an edge continue on the opposite edge. Consistent scale, style and colors across the tile. Never add borders, frames, vignettes, gradients or drop shadows. Add the requested layout style.
-- mockup: product, size, scene, camera angle, lighting, colors, "lifestyle product photography, professional photo". Leave the product surface blank for the user's design.
-- coloring: ALWAYS black and white line art, thick clean outlines, no shading, no gray, no color fill, white background, all elements fully visible, age and complexity appropriate.
-- kidsbook: build a CHARACTER BIBLE (name, age, hair, eyes, skin tone, clothing, defining feature, art style, consistent character design) and repeat it in full inside the scene prompt: "children's book illustration, [bible], [where and what], [mood], [time of day], [style], warm colors, soft lighting, magical atmosphere, age-appropriate".
-- planner: covers (main, complementary, frame/background, space for title) or printable inner pages (minimal design, clean lines, white background) or stickers (isolated, white border).
+- mockup: pick props and setting matching the niche. Product, size, scene, camera angle, lighting, colors, "lifestyle product photography, professional photo". Leave the product surface blank for the user's design.
+- coloring: if the kind says a book of 10 pages, return 10 items, each a different page in the same niche and style, with a short Bulgarian title. Respect line weight, drawing style and page format. ALWAYS black and white line art, thick clean outlines, no shading, no gray, no color fill, white background, all elements fully visible, age and complexity appropriate.
+- kidsbook: also use the story world, time of day and page type (scene, cover with open title area, full body character on white, or double page spread). Build a CHARACTER BIBLE (name, age, hair, eyes, skin tone, clothing, defining feature, art style, consistent character design) and repeat it in full inside the scene prompt: "children's book illustration, [bible], [where and what], [mood], [time of day], [style], warm colors, soft lighting, magical atmosphere, age-appropriate".
+- planner: use the chosen product, size and layout. Niche shapes the sections and small decorative motifs (for example fitness: water, steps, sleep trackers; finance: income, expenses, savings boxes). Covers (main, complementary, frame/background, space for title) or printable inner pages (minimal design, clean lines, white background) or stickers (isolated, white border).
 - card: decorations around the outside, a large clean blank area for text, no lettering, nothing cropped.
 - tshirt: print design. Use the exact print area and orientation given in the product line. Complete artwork, nothing cropped, isolated on the chosen background, print-ready. For mugs: landscape wrap, three strict equal vertical zones (left illustration, center text only, right small accent), no solid background. If a tagline is given, put it in single quotes as text to render.
 - pack: separate prompts in 4 groups: main elements, complementary elements, frames and backgrounds, full compositions.
@@ -548,7 +553,7 @@ MODES (field "mode")
 - improve: improve base_prompt according to "change" (Bulgarian). Return one item.
 - variations: return 3 items, each a different variation of base_prompt (different composition, subject detail or mood) with titles "Вариант 1".."Вариант 3".
 - recolor: rewrite base_prompt with the new palette_en, keep everything else. One item.
-- collection: return "count" items per group in 4 groups, titles prefixed by group in Bulgarian: "Основни елементи", "Допълващи елементи", "Рамки и фонове", "Пълни композиции". Main and complementary groups have "count" items each, frames 3 items, compositions 3 items. All share one style and palette. Never exceed 25 items total.
+- collection: return "count" items per group in 4 groups, titles prefixed by group in Bulgarian: "Основни елементи", "Допълващи елементи", "Рамки и фонове", "Пълни композиции". Main and complementary groups have "count" items each, frames 3 items, compositions 3 items. All share one style and palette. Never exceed 30 items total.
 - patternset: return 4 items: "Основна шарка", "Допълваща шарка 1", "Допълваща шарка 2", "Спокойна шарка". Same palette and style, different density and motif sizes, the calm one with sparse small motifs. All follow the seamless rules.
 Each item: {"title": string, "prompt": English string, "explain": Bulgarian string}."""
 
@@ -648,7 +653,7 @@ async def promptartis(req: PromptArtisIn, request: Request):
         ideas = [str(x)[:200] for x in (data.get("ideas") or [])][:6]
         return {"ideas": ideas, "remaining": remaining}
     items = []
-    for it in (data.get("items") or [])[:25]:
+    for it in (data.get("items") or [])[:30]:
         if not isinstance(it, dict) or not it.get("prompt"):
             continue
         items.append({
