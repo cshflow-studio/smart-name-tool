@@ -334,6 +334,7 @@ def _on_startup():
 DAILY_LIMIT_ANALYZE = 100  # AI преименувания, дневен лимит
 DAILY_LIMIT_UPSCALE = 30   # AI upscale, дневен лимит, стига за един пакет
 DAILY_LIMIT_PROMPTARTIS = 60  # PromptArtis заявки, дневен лимит
+PROMPTARTIS_MODEL = os.getenv("PROMPTARTIS_MODEL", "claude-haiku-4-5-20251001")  # смени го в Render, без нов код
 
 # { "analyze": { "192.168.1.1": {"date": "2026-07-15", "count": 45} } }
 _counts: dict = {
@@ -439,6 +440,8 @@ def get_limit(request: Request):
         # нови полета за AI Upscaler
         "upscale_remaining": remaining_for("upscale", ip),
         "upscale_limit":     DAILY_LIMIT_UPSCALE,
+        "promptartis_remaining": remaining_for("promptartis", ip),
+        "promptartis_limit":     DAILY_LIMIT_PROMPTARTIS,
     }
 
 
@@ -553,6 +556,7 @@ MODES (field "mode")
 - improve: improve base_prompt according to "change" (Bulgarian). Return one item.
 - variations: return 3 items, each a different variation of base_prompt (different composition, subject detail or mood) with titles "Вариант 1".."Вариант 3".
 - recolor: rewrite base_prompt with the new palette_en, keep everything else. One item.
+- collection and pack: the user's own theme (in base_prompt, in Bulgarian) is the MAIN SUBJECT of every single prompt. Translate it faithfully and show it in each prompt: if the theme is funny cupids in a kitchen, every prompt shows funny cupids doing kitchen things (cooking heart shaped cookies, stirring a pot, flipping pancakes, baking, tasting soup), with kitchen props such as pots, whisks, aprons, oven mitts, spoons, flour. The niche (niche_en) is only a seasonal or topical context and must never replace the user's theme. Keep the requested mood (for example funny, cute). Each prompt differs in action, pose or props. Group 1 main illustrations feature the hero in different actions, group 2 are small related props, group 3 are frames and wreaths built from the theme props, group 4 are full scenes.
 - collection: return "count" items per group in 4 groups, titles prefixed by group in Bulgarian: "Основни елементи", "Допълващи елементи", "Рамки и фонове", "Пълни композиции". Main and complementary groups have "count" items each, frames 3 items, compositions 3 items. All share one style and palette. Never exceed 30 items total.
 - patternset: return 4 items: "Основна шарка", "Допълваща шарка 1", "Допълваща шарка 2", "Спокойна шарка". Same palette and style, different density and motif sizes, the calm one with sparse small motifs. All follow the seamless rules.
 Each item: {"title": string, "prompt": English string, "explain": Bulgarian string}."""
@@ -627,7 +631,7 @@ async def promptartis(req: PromptArtisIn, request: Request):
 
     def _call():
         return claude.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=PROMPTARTIS_MODEL,
             max_tokens=6000 if mode in ("collection", "patternset", "variations", "photo") or "10 " in json.dumps(req.fields, ensure_ascii=False) else 2000,
             system=PA_SYSTEM,
             messages=[{"role": "user", "content": content}],
