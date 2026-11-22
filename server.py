@@ -38,7 +38,7 @@ app = FastAPI(title="AI Rabotilnica API", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -1210,4 +1210,71 @@ def delete_prompt(prompt_id: int, request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Грешка при изтриване: {str(e)}")
+
+
+@app.get("/admin/prompts")
+def admin_list_prompts(request: Request):
+    """Кратък списък на промптовете (id, заглавие, категория, брой резултати и колко от тях имат снимка). Само с администраторски ключ."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT p.id, p.title, p.category,
+                           COUNT(r.id) AS results,
+                           COUNT(r.image_data) AS with_image
+                    FROM prompts p
+                    LEFT JOIN prompt_results r ON r.prompt_id = p.id
+                    GROUP BY p.id, p.title, p.category
+                    ORDER BY p.id DESC
+                    """
+                )
+                rows = cur.fetchall()
+        return {"prompts": [dict(r) for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при четене: {str(e)}")
+
+
+@app.post("/prompts/{prompt_id}/results")
+def add_prompt_result(prompt_id: int, req: PromptResultIn, request: Request):
+    """Добавя AI резултат (със снимка) към вече качен промпт. Ако промптът има резултат със същия AI инструмент и без снимка, снимката се слага в него. Само с администраторски ключ."""
+    check_admin(request)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL не е зададен.")
+    if not req.ai_tool.strip() or not req.image_data.strip():
+        raise HTTPException(status_code=400, detail="AI инструмент и снимка са задължителни.")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT id FROM prompts WHERE id = %s", (prompt_id,))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="Няма промпт с този id.")
+                cur.execute(
+                    "SELECT id FROM prompt_results WHERE prompt_id = %s AND ai_tool = %s AND image_data IS NULL ORDER BY id LIMIT 1",
+                    (prompt_id, req.ai_tool.strip()),
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        "UPDATE prompt_results SET image_data = %s, rating = COALESCE(%s, rating) WHERE id = %s",
+                        (req.image_data, req.rating.strip() or None, row["id"]),
+                    )
+                    result_id = row["id"]
+                else:
+                    cur.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM prompt_results WHERE prompt_id = %s", (prompt_id,))
+                    n = cur.fetchone()["n"]
+                    cur.execute(
+                        "INSERT INTO prompt_results (prompt_id, ai_tool, image_data, rating, sort_order) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                        (prompt_id, req.ai_tool.strip(), req.image_data, req.rating.strip() or None, n),
+                    )
+                    result_id = cur.fetchone()["id"]
+            conn.commit()
+        return {"status": "ok", "id": prompt_id, "result_id": result_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Грешка при запис: {str(e)}")
 
