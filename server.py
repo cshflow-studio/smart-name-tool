@@ -525,13 +525,17 @@ Reply with ONLY valid JSON, no code fences, no extra text.
 GENERAL RULES
 - Never mention real artists, brands, trademarks or famous characters.
 - Prompts are plain text without markdown. One prompt is one paragraph of comma separated phrases.
-- Keep prompts 40 to 110 words. Be concrete: subject, details, style, palette, background, composition.
+- Keep prompts 80 to 130 words. Be concrete and rich, never generic.
 - Use the given style and palette phrases when provided. If the palette is empty and the user asked to suggest one, choose a fitting palette and name its colors in the prompt.
 - If a creative card is given, keep theme, motifs, style, palette, mood and "keep" elements consistent with it.
 - Platform: for Midjourney append ONLY the aspect ratio as --ar W:H when a ratio is given, plus --tile for seamless patterns. Add no other parameters. For other platforms add no parameters.
 
 MASTER QUALITY
-- Write master level prompts: concrete subject, rich specific details, composition, lighting, texture, mood and finishing, 60 to 130 words, no filler.
+- Every prompt follows this anatomy, in this order, as one flowing paragraph of comma separated phrases: (1) exact subject with count, age or species and distinctive features such as hair, face, wings, clothing and accessories; (2) a concrete action and pose that carries the humor or story; (3) facial expression and emotion; (4) props and 3 to 5 small secondary details that touch the subject; (5) art style with medium, technique, line quality and brush or texture detail; (6) palette using specific color names assigned to elements, not only a generic palette label; (7) lighting, shading and finishing texture; (8) composition and background; (9) technical constraints for the product type.
+- Be specific instead of vague. Replace words like cute, funny or nice with the visible thing that makes it so (for example: tongue poking out, flour puffs, tilted chef hat, oversized spoon).
+- Keep the user's exact subject. If the user says cupid, keep cupid features (small feathered wings, tiny bow or heart arrow) and do not swap it for a generic cherub or angel.
+- For a single clipart element, keep the scene minimal: the subject carries a few attached props, and no full background scene.
+- Quality level example for clipart (never copy its subject): "A funny chubby cupid baby with tiny feathered wings, rosy cheeks and curly golden hair, wearing a flour dusted red apron and a tilted chef hat, balancing on one foot while flipping a heart shaped pancake high above a small frying pan, cheeky wide eyed grin with tongue poking out, a tiny whisk tucked under one wing, puffs of flour and a few small pink hearts floating around him, whimsical children's book watercolor illustration with soft ink outlines, gentle brush texture and delicate shading, palette of rose pink, cream, sage green and touches of gold on the wings and apron buttons, soft even lighting, single complete character fully visible and centered, plain white background, clean crisp edges ready for clipart, no text, nothing cropped"
 - Fields may include niche (niche_en gives the English term), keywords and extra. Weave the niche and keywords naturally into the prompt as concrete motifs and mood. Follow "extra" instructions exactly.
 - In the Bulgarian explain field, say which niche, format and key choices you applied.
 
