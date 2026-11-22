@@ -589,16 +589,34 @@ class PromptArtisIn(BaseModel):
 
 
 def _pa_json(text: str):
+    """Чете JSON от отговора на модела, дори когато е в кодов блок, с текст около него или отрязан."""
     text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
-            return json.loads(m.group(0))
-        raise
+    text = re.sub(r"^```(?:json)?\s*", "", text).strip()
+    text = re.sub(r"```\s*$", "", text).strip()
+    dec = json.JSONDecoder()
+    start = text.find("{")
+    if start >= 0:
+        try:
+            obj, _ = dec.raw_decode(text[start:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    # отрязан или повреден отговор: вадим всички цели обекти с prompt
+    items = []
+    for m in re.finditer(r'\{\s*"title"', text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+            if isinstance(obj, dict) and obj.get("prompt"):
+                items.append(obj)
+        except Exception:
+            continue
+    if items:
+        return {"items": items}
+    ideas = re.findall(r'"((?:[^"\\]|\\.)+)"', text[text.find("["):]) if '"ideas"' in text and "[" in text else []
+    if ideas:
+        return {"ideas": [i for i in ideas if i != "ideas"]}
+    raise ValueError("no json")
 
 
 @app.post("/promptartis")
@@ -636,7 +654,7 @@ async def promptartis(req: PromptArtisIn, request: Request):
     def _call():
         return claude.messages.create(
             model=PROMPTARTIS_MODEL,
-            max_tokens=6000 if mode in ("collection", "patternset", "variations", "photo") or "10 " in json.dumps(req.fields, ensure_ascii=False) else 2000,
+            max_tokens=8000 if (mode in ("collection", "patternset", "variations", "photo") or "6 " in json.dumps(req.fields, ensure_ascii=False) or "10 " in json.dumps(req.fields, ensure_ascii=False)) else 3000,
             system=PA_SYSTEM,
             messages=[{"role": "user", "content": content}],
         )
@@ -648,9 +666,11 @@ async def promptartis(req: PromptArtisIn, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Неочаквана грешка: {str(e)}")
 
+    raw = "".join(getattr(b, "text", "") for b in message.content if getattr(b, "type", "") == "text")
     try:
-        data = _pa_json(message.content[0].text)
+        data = _pa_json(raw)
     except Exception:
+        print(f"PromptArtis: неразбираем отговор (mode={mode}, stop={getattr(message, 'stop_reason', '')}): {raw[:400]!r}")
         raise HTTPException(status_code=502, detail="Отговорът не беше в очаквания формат. Опитай пак.")
 
     remaining = increment("promptartis", ip)
