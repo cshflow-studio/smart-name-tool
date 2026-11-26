@@ -334,6 +334,7 @@ def _on_startup():
 DAILY_LIMIT_ANALYZE = 100  # AI преименувания, дневен лимит
 DAILY_LIMIT_UPSCALE = 30   # AI upscale, дневен лимит, стига за един пакет
 DAILY_LIMIT_PROMPTARTIS = 60  # PromptArtis заявки, дневен лимит
+DAILY_LIMIT_UPSCALE_TILES = 600  # допълнителни части на големи снимки (една снимка се брои веднъж за члена)
 PROMPTARTIS_MODEL = os.getenv("PROMPTARTIS_MODEL", "claude-haiku-4-5-20251001")  # смени го в Render, без нов код
 
 # { "analyze": { "192.168.1.1": {"date": "2026-07-15", "count": 45} } }
@@ -341,8 +342,9 @@ _counts: dict = {
     "analyze": defaultdict(lambda: {"date": "", "count": 0}),
     "upscale": defaultdict(lambda: {"date": "", "count": 0}),
     "promptartis": defaultdict(lambda: {"date": "", "count": 0}),
+    "upscale_tiles": defaultdict(lambda: {"date": "", "count": 0}),
 }
-_limits = {"analyze": DAILY_LIMIT_ANALYZE, "upscale": DAILY_LIMIT_UPSCALE, "promptartis": DAILY_LIMIT_PROMPTARTIS}
+_limits = {"analyze": DAILY_LIMIT_ANALYZE, "upscale": DAILY_LIMIT_UPSCALE, "promptartis": DAILY_LIMIT_PROMPTARTIS, "upscale_tiles": DAILY_LIMIT_UPSCALE_TILES}
 
 
 def get_ip(request: Request) -> str:
@@ -370,7 +372,7 @@ def check_admin(request: Request) -> None:
 
 # И двата инструмента се броят на дневна база, за да могат хората да
 # минат цял пакет изображения наведнъж, без да чакат месец.
-_PERIOD_KIND = {"analyze": "daily", "upscale": "daily", "promptartis": "daily"}
+_PERIOD_KIND = {"analyze": "daily", "upscale": "daily", "promptartis": "daily", "upscale_tiles": "daily"}
 
 
 def _period_key(kind: str) -> str:
@@ -421,6 +423,7 @@ class UpscaleRequest(BaseModel):
     media_type:   str          # "image/png" или "image/jpeg"
     scale:        int  = 4     # 2 или 4
     face_enhance: bool = False # включи за портрети/карикатури
+    extra_tile:   bool = False # 2-ра и следващи части на една голяма снимка: не се броят като ново увеличение
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -748,7 +751,10 @@ async def upscale_image(req: UpscaleRequest, request: Request):
         raise HTTPException(status_code=400, detail="scale трябва да е 2 или 4.")
 
     ip  = get_ip(request)
-    rem = remaining_for("upscale", ip)
+    kind = "upscale_tiles" if req.extra_tile else "upscale"
+    rem = remaining_for(kind, ip)
+    if rem <= 0 and req.extra_tile:
+        raise HTTPException(status_code=429, detail="Дневният лимит за части от големи снимки е достигнат. Опитай утре.")
     if rem <= 0:
         raise HTTPException(
             status_code=429,
@@ -768,7 +774,9 @@ async def upscale_image(req: UpscaleRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Replicate грешка: {str(e)}")
 
-    remaining = increment("upscale", ip)
+    remaining = increment(kind, ip)
+    if req.extra_tile:
+        remaining = remaining_for("upscale", ip)
     return {"url": url, "remaining": remaining}
 
 # ── Проверка на базата данни ──────────────────────────────────────────────
